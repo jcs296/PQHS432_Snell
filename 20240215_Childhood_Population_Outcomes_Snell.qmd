@@ -1,0 +1,499 @@
+---
+title: "Birth Rate and Child Poverty in US Counties in 2022"
+subtitle: "Predicting birth rate and child poverty using maternal and childhood factors in 2022 data"
+author: "John Snell"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: spacelab
+---
+
+## R Packages and Setup {.unnumbered}
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA)
+
+library(car)
+library(gtsummary)
+library(Hmisc)
+library(janitor)
+library(knitr)
+library(naniar)
+library(patchwork)
+library(tidyverse)
+
+theme_set(theme_bw())
+```
+
+# Data Source
+
+The data that we will be looking at come from two sources:
+
+[County Health Rankings 2022 Data](https://www.countyhealthrankings.org/health-data/methodology-and-sources/rankings-data-documentation)
+
+[CDC WONDER 2016-2022 Natality Data](https://wonder.cdc.gov/natality.html)
+
+In order to access the CDC data, an agreement must be made in order to access the data, and then some categories must be marked in order to query specific data, which provides the columns of interest.  Most columns were included in the query in the data that was downloaded.  As a result of this, a local file needs to be produced for this data.  The 2016-2022 data portal was selected.  Results were grouped by County of Residence, and the measures "Birth Rate", "Average Age of Mother (years)", "Average Birth Weight (grams)", "Average Pre-pregnancy BMI", "Average Number of Prenatal Visits", and "Average Interval Since Last Live Birth (months)" were selected. Results were exported, showing totals, zero values, and suppressed values, up to 3 decimal places in the data acquisition.
+
+Natality data reflects nationwide records regarding births and infant data that result from county-level birth certificate records and associated maternal data.  Data are updated annually.
+
+County Health Rankings data is a composite collection of data from multiple sources.  Following compiling of the data, weights are assigned to each county, z-scores are calculated, composite scores are created, and counties are then ranked.  We are utilizing the functional "raw" versions of the data.  Details about data collection methods can be found [here](https://www.countyhealthrankings.org/sites/default/files/media/document/2023%20CHRR%20Technical%20Document.pdf).
+
+# The Subjects
+
+The subjects are amalgamated data for various counties from the United States of America, based on data availability for appropriate measures in respective datasets.  The Natality data will contain the outcome of our linear regression, the birth rate, and the county health rankings data will contain the untransformed logistic regression outcome of childhood poverty percentage, for which we will be predicting if a county is above or below the national average of [16.3% in 2022](https://www.census.gov/library/stories/2023/12/poverty-rate-varies-by-age-groups.html).  The final tibble will include 569 counties, which is driven by fewer counties being included in the Natality data than in the County Health Rankings data.  Data are not exclusively adults, as the CDC WONDER database for Natality does not allow for exclusion of teenage mothers when querying the Natality 2016-2022 dataset for birth rate.
+
+# Loading and Tidying the Data
+
+## Loading the Raw Data
+
+### Elements We Will Collect
+From the Natality data, we will want to utilize the following variables:
+
+* County of Residence
+  * Contains both county and state information.  This data will be split into 2 variables
+* Birth Rate
+  * Number of births divided by total population in 2016-2022 data, multiplied by 1000
+* Average Age of Mother (Years)
+  * average age of mothers in that county
+* Average Birth Weight (grams)
+  * Average weight of newborn in grams
+* Average Pre-pregnancy BMI
+  * Average BMI value for mother pre-pregnancy
+* Average Number of Prenatal Visits
+  * Average number of doctor visits mother made before giving birth
+* Average Interval Since Last Live Birth
+  * Average number of months between birth events
+  
+From the County Health Rankings data, we will want to utilize the following variables:
+
+* fipscode
+  * Federal Information Processing Standard, will be used as identifier
+* county
+  * County name
+* state
+  * State name
+* v024_rawvalue
+  * Percent of children in poverty.  Will be converted into factor based on whether county is above or below the national average
+* v082_rawvalue
+  * Percent of children in single parent households
+* v128_rawvalue
+  * Number of deaths among residents under age 18 per 100,000 population
+* v122_rawvalue
+  * Percentage of children under age 19 without health insurance
+* v058_rawvalue
+  * Percentage of population estimated to live in rural area based on census data.  Will be turned into a factor variable.
+
+### Ingesting the Data
+
+First, we will want to load in the data we will use.  Because of the nature of the data that was pulled for natality, a local download needed to occur.  Relevant files are submitted.
+
+```{r}
+#| message: false
+#| warning: false
+
+natality2022 <- tibble(read_tsv("data/Natality, 2016-2022 expanded.txt"))
+chr2022 <- tibble(read_csv("https://www.countyhealthrankings.org/sites/default/files/media/document/analytic_data2022.csv", skip = 1))
+```
+
+## Cleaning the Data
+
+### Minor Corrections
+
+Within the Natality data, a "notes" column with text descriptions exists, and all other variables are marked as 'NA'  The Natality data also includes a pseudo-county for unincluded data, which will be removed.  For the County Health Rankings data, each state, as well as the nation as a whole, are included as rows.  Additionally, uncounted counties in the County Health Rankings data will not be included.  I will want to remove the relevant lines from each dataset.
+
+```{r}
+USstates = c("United States",'Alabama','Alaska','Arizona',
+  'Arkansas','California','Colorado','Connecticut',
+  'Delaware','Florida','Georgia','Hawaii',
+  'Idaho','Illinois','Indiana','Iowa',
+  'Kansas','Kentucky','Louisiana','Maine',
+  'Maryland','Massachusetts','Michigan','Minnesota',
+  'Mississippi','Missouri','Montana','Nebraska',
+  'Nevada','New Hampshire','New Jersey','New Mexico',
+  'New York','North Carolina','North Dakota','Ohio',
+  'Oklahoma','Oregon','Pennsylvania','Rhode Island',
+  'South Carolina','South Dakota','Tennessee','Texas',
+  'Utah','Vermont','Virginia','Washington',
+  'West Virginia','Wisconsin','Wyoming')
+
+
+natality2022 <- natality2022 |>
+  select(-Notes) |>
+  drop_na() |>
+  filter(!`County of Residence` == "Unidentified Counties, CT") |> #data are all 0's for this pseudo county
+  mutate(`Birth Rate` = na_if(`Birth Rate`, 'Not Available'))
+
+chr2022 <- chr2022 |>
+  filter(!county %in% USstates) |>
+  filter(`county_ranked` == 1)
+```
+
+### Selecting Variables We'll Use
+
+For the Natality data, we will first need to split the "County of Residence" data into 2 columns, as the state and county data currently exist as a composite variable.  Otherwise, appropriate variables need to be selected for both Natality and County Health Rankings Data
+
+```{r}
+natality2022 <- cbind(natality2022,
+                      str_split_fixed(natality2022$`County of Residence`, ", ", 2))
+natality2022 <- natality2022 |>
+  select('1',
+        '2',
+        'Birth Rate',
+        'Average Age of Mother (years)',
+        'Average Birth Weight (grams)',
+        'Average Pre-pregnancy BMI',
+        'Average Number of Prenatal Visits',
+        'Average Interval Since Last Live Birth (months)')
+
+chr2022 <- chr2022 |>
+  select('fipscode',
+         'county',
+         'state',
+         'v024_rawvalue', # children in poverty
+         'v082_rawvalue', # children in single parent household
+         'v128_rawvalue', # child mortality
+         'v122_rawvalue', # uninsured children
+         'v058_rawvalue') # percent rural
+```
+
+### Changing Variable Names
+
+Variables will now be given more appropriate names
+
+```{r}
+natality2022 <- natality2022 |>
+  rename('county' = '1',
+        'statecode' = '2',
+        'birth_rt' = 'Birth Rate',
+        'moth_age' = 'Average Age of Mother (years)',
+        'birth_wgt' = 'Average Birth Weight (grams)',
+        'preprg_bmi' = 'Average Pre-pregnancy BMI',
+        'pren_vis' = 'Average Number of Prenatal Visits',
+        'birth_int' = 'Average Interval Since Last Live Birth (months)') |>
+  clean_names()
+  
+  chr2022 <- chr2022 |>
+  rename('fipscode' = 'fipscode',
+         'county' = 'county',
+         'statecode' = 'state',
+         'chld_pov' = 'v024_rawvalue',
+         'chld_sph' = 'v082_rawvalue',
+         'chld_mort' = 'v128_rawvalue',
+         'chld_unin' = 'v122_rawvalue',
+         'pct_rural' = 'v058_rawvalue') |>
+  clean_names()
+
+```
+
+### Combining the Data
+
+Here, we will combine the two datasets into one larger one.  We will also filter again for complete data.
+
+```{r}
+child2022 <- left_join(chr2022, natality2022, by=c('county','statecode'))
+
+child2022 <- child2022 |>
+  drop_na()
+```
+
+### Correcting Percentages
+
+For each percentage based variable, we will want to multiply them by 100 so that they are not in decimal form.
+
+```{r}
+child2022 <- child2022 |>
+  mutate(chld_pov = chld_pov*100) |>
+  mutate(chld_sph = chld_sph*100) |>
+  mutate(chld_unin = chld_unin*100) |>
+  mutate(pct_rural = pct_rural*100)
+```
+
+### Creating Binary Value for Logistic Regression
+
+For the Logistic regression, we will want to create a binary, for whether a county is above the national average child poverty percentage of 16.3% (yes) or not (no).  This will be saved in the variable `hi_chld_pov`.
+
+```{r}
+child2022 <- child2022 |>
+  mutate(hi_chld_pov = cut(chld_pov,
+                            breaks = c(0,16.3,100),
+                            labels = c("no","yes")))
+```
+
+### Creating Factor for Percent Rural Called `urban`
+
+In order to generate a categorical input, we will be grouping the `pct_rural` data into groups of how urban a county is:
+
+* 0-10% = Very High
+* 10-20% = High
+* 20-30% = Medium
+* 30-64.5% = Low (64.5% is most rural in dataset)
+
+The new variable will be called `urban`.  Additionally, the lower boundary is being set as -1, so that counties with a rural percentage of 0 are not excluded in the data.
+
+```{r}
+child2022 <- child2022 |>
+  mutate(urban = cut(pct_rural,
+                            breaks = c(-1,10,20,30,100),
+                            labels = c("Very High","High","Medium","Low")))
+
+```
+
+### Sampling the Data
+
+Since our dataframe has `r nrow(child2022)` rows, we will not need to sample the data as there are between 100 and 1200 data points for us to consider.
+
+### Converting Variable Types
+
+now, we need to check column data types.
+```{r}
+child2022
+```
+
+`fipscode` needs to be converted to a character variable, `birth_rt` needs to be converted to a numeric variable,  and `statecode` will be converted to a factor variable (although it doesn't matter all too much for our purposes here).
+
+```{r}
+child2022 <- child2022 |>
+  mutate(fipscode = as.character(fipscode)) |>
+  mutate(birth_rt = as.numeric(birth_rt)) |>
+  mutate(statecode = as.factor(statecode))
+
+child2022
+```
+
+### Arranging the Tibble
+
+Now, we will want to rearrange the tibble in a more useful manner, as well as remove the redundant `chld_pov` and `pct_rural` variables.
+
+```{r}
+child2022 <- child2022 |>
+  select(fipscode, county, statecode, birth_rt, moth_age, birth_wgt, 
+         preprg_bmi, birth_int, chld_sph, pren_vis, urban,
+         hi_chld_pov, chld_mort, chld_unin)
+dim(child2022)
+```
+
+# The Tidy Tibble
+
+## Listing the Tibble
+
+```{r}
+child2022
+```
+
+## Size and Identifiers
+
+the new tibble has `r nrow(child2022)` observations and `r ncol(child2022)` variables.  Of those variables, the primary identifier column is `fipscode`.  However, the `county` and `statecode` variables also provide some identifier functions.  The remainder 10 variables function as the non-identifier data.  Each row is unique, as can be seen when we test if there are an identical total number of rows and distinct rows.
+
+```{r}
+identical(nrow(child2022),n_distinct(child2022))
+```
+
+## Save The Tibble
+
+```{r}
+write_rds(child2022, "data/child2022.Rds")
+```
+
+Now that we have saved our data, we will do a little bit of garbage collection briefly.
+
+```{r}
+rm(USstates,chr2022,natality2022)
+```
+
+# The Code Book
+
+## Defining the Variables
+
+1. **Sample Size** The data in our complete `child2022` sample consist of `r nrow(child2022)` subjects that are present in both the CDC WONDER natality data from 2016-2022 and the County Health Records 2022 data, where all data are present.
+2. **Missingness** Of the `r nrow(child2022)` subjects, `r n_case_complete(child2022 |> select(birth_rt, moth_age, birth_wgt, preprg_bmi, pren_vis, birth_int, urban, hi_chld_pov, chld_sph, chld_mort, chld_unin))` have complete data on all variables listed below.
+3. Our **outcome** variables are `birth_rt`, the number of births divided by county population for each county for the linear regression, and `chld_pov_lvl`, which indicates whether a county's child poverty percentage is above (yes) the national average or not (no) for the logistic regression. There are no missing data in either of these outcomes, as is tested in inline coding for the missingness check.
+4. Candidate **predictors** for my models include `moth_age`,`birth_wgt`, `preprg_bmi`, and `birth_int` for the linear model, and `chld_mort`, and `chld_unin` for the logistic model.  The variables `pren_vis`, `urban`, and `chld_sph` will be considered for both models.
+5. The **identifying variables** for the data are `fipscode`, `county`, and `statecode`.
+
+| Variable | Type | Role | Sample Size | Distinct | Missing | Description |
+| -------- | ---- | ---- | ----------- | -------- | ------- | ----------- |
+| `fipscode` | character | Identifier | `r length(child2022$fipscode) - n_miss(child2022$fipscode)` |`r n_distinct(child2022$fipscode)` | `r n_miss(child2022$fipscode)` | County Federal Information Processing Standard identifier code |
+| `county` | character | Identifier | `r length(child2022$county) - n_miss(child2022$county)` | `r n_distinct(child2022$county)` | `r n_miss(child2022$county)` | County name |
+| `statecode` | factor (50 categories) | Identifier | `r length(child2022$statecode) - n_miss(child2022$statecode)` |`r n_distinct(child2022$statecode)` | `r n_miss(child2022$statecode)` | State 2 letter identifier |
+| `birth_rt` | numeric | outcome (linear) | `r length(child2022$birth_rt) - n_miss(child2022$birth_rt)` | `r n_distinct(child2022$birth_rt)` | `r n_miss(child2022$birth_rt)` | Rate at which children are born |
+| `moth_age` | numeric | input (linear) | `r length(child2022$moth_age) - n_miss(child2022$moth_age)` | `r n_distinct(child2022$moth_age)` | `r n_miss(child2022$moth_age)` | Average age of mother for newborns |
+| `birth_wgt` | numeric | input (linear) | `r length(child2022$birth_wgt) - n_miss(child2022$birth_wgt)` | `r n_distinct(child2022$birth_wgt)` | `r n_miss(child2022$birth_wgt)` | Average birth weight in grams |
+| `preprg_bmi` | numeric | input (linear) | `r length(child2022$preprg_bmi) - n_miss(child2022$preprg_bmi)` | `r n_distinct(child2022$preprg_bmi)` | `r n_miss(child2022$preprg_bmi)` | Average BMI of mother before pregnancy |
+| `birth_int` | numeric | input (linear) | `r length(child2022$birth_int) - n_miss(child2022$birth_int)` | `r n_distinct(child2022$birth_int)` | `r n_miss(child2022$birth_int)` | Average interval between births by mother in months |
+| `chld_sph` | numeric | input (both) | `r length(child2022$chld_sph) - n_miss(child2022$chld_sph)` | `r n_distinct(child2022$chld_sph)` | `r n_miss(child2022$chld_sph)` | Percentage of children living in single parent households |
+| `pren_vis` | numeric | input (both) | `r length(child2022$pren_vis) - n_miss(child2022$pren_vis)` | `r n_distinct(child2022$pren_vis)` | `r n_miss(child2022$pren_vis)` | Average number of prenatal visits by mother |
+| `urban` | factor (4 categories) | input (both) | `r length(child2022$urban) - n_miss(child2022$urban)` | `r n_distinct(child2022$urban)` | `r n_miss(child2022$urban)` | How urban a county is (Very High, High, Medium, Low) |
+| `hi_chld_pov` | factor (2 categories) | outcome (logistic) | `r length(child2022$hi_chld_pov) - n_miss(child2022$hi_chld_pov)` | `r n_distinct(child2022$hi_chld_pov)` | `r n_miss(child2022$hi_chld_pov)` | Is county above national child poverty level of 16.3%? (yes/no) |
+| `chld_mort` | numeric | input (logistic) | `r length(child2022$chld_mort) - n_miss(child2022$chld_mort)` | `r n_distinct(child2022$chld_mort)` | `r n_miss(child2022$chld_mort)` | Deaths per 100,000 in residents under age 18 |
+| `chld_unin` | numeric | input (logistic) | `r length(child2022$chld_unin) - n_miss(child2022$chld_unin)` | `r n_distinct(child2022$chld_unin)` | `r n_miss(child2022$chld_unin)` | Percentage of children without health insurance |
+
+### Using `gtsummary` for a Partial Codebook
+```{r}
+tbl_summary(select(child2022, -c(fipscode, county, statecode)),
+        label = list(
+            birth_rt = "Birth Rate",
+            moth_age = "Age of Mother (years)",
+            birth_wgt = "Birth Weight (grams)",
+            preprg_bmi = "Prepregnancy BMI",
+            pren_vis = "Number of prenatal doctor visits",
+            birth_int = "Time between last and current birth (months)",
+            urban = "How Urban county is",
+            chld_sph = "Percentage of children living in single parent households",
+            hi_chld_pov = "hi_chld_pov (child poverty above national average)",
+            chld_mort = "Child mortality per 100,000",
+            chld_unin = "Percentage of children without health insurance"),
+        stat = list( all_continuous() ~ 
+                "{median} [{min} to {max}]" ))
+```
+
+## Numerical Description
+
+```{r}
+describe(child2022) |> html()
+```
+
+# Linear Regression Plans
+
+## My First Research Question
+
+Can we effectively predict the birth rate in a United States county by using the average age of the mother, the average birth weight, the mother's prepregnancy BMI, the average number of prenatal doctor visits, the average interval between births, the urban status of the county, and the percentage of children in single parent households in a subset of 576 counties?
+
+Since the birth rate in an area can impact future economic factors, health opportunities, and educational opportunities, being able to predict the newborn cohort sizes has important governmental implications.
+
+## My Quantitative Outcome
+
+The quantitative outcome that we will seek to predict will be `birth_rt` as observed in the `child2022` tibble.  I am interested in predicting this variable since the number of births that occur in an area can impact future economic factors, health opportunities, and educational opportunities.  Being able to predict the newborn cohort sizes has important governmental implications in regard to population dynamics.
+
+In the `child2022` tibble, `r nrow(child2022) - n_miss(child2022$birth_rt)` rows contain complete information on this outcome.
+
+### Distribution of Outcome
+
+```{r}
+plotA <- ggplot(child2022) +
+  geom_histogram(aes(x = birth_rt), color = "black", fill = "orange", bins=50) +
+  labs(x = "Birth Rate",
+       y = "Number of Counties",
+       title = "Births per County in child2022")
+plotB <- ggplot(child2022) +
+  geom_violin(aes(x = birth_rt, y = "child2022"), color = "black",fill = "orange") +
+  geom_boxplot(aes(x = birth_rt, y = "child2022"), color = "black", fill = "cyan", alpha = .5) +
+  scale_x_log10(labels = scales::comma) +
+  labs(x = "Birth Rate (log scale)",
+       y = "",
+       title = "Birth Rate per County in child2022")
+plotC <- ggplot(child2022, aes(sample = birth_rt)) +
+  geom_qq(color = 'black') +
+  geom_qq_line(color = 'red') +
+  labs(x = '',
+       y = 'Birth Rate',
+       title = 'Normal Q-Q Plot of Birth Rate')
+
+(plotA + plotC)/plotB
+```
+
+When looking at the outcome distribution, we observe a slight rightward skew in the data, with a median birth rate of `r median(child2022$birth_rt)`, and a range of `r min(child2022$birth_rt)` to `r max(child2022$birth_rt)`  The skew largely lies at the right end of the data, as is most apparent in the Q-Q plot curving upwards at the right end.  It is also important to question if a transformation will be necessary, as there is some skew.
+
+```{r}
+boxCox(lm(birth_rt ~ moth_age + birth_wgt + preprg_bmi + pren_vis + birth_int + urban + chld_sph, data = child2022))
+```
+
+In order to correct the rightward skew, we would want to consider applying a square root of the outcome, as the apparent lambda is approximately 0.5.
+
+## My Planned Predictors (Linear Model)
+
+The predictors that I plan to use in my linear model are `moth_age`, `birth_wgt`, `preprg_bmi`, `pren_vis`, `birth_int`, `urban`, and `chld_sph`.  All of these variables are quantitative variables as found in the `child2022` tibble.
+
+* `moth_age` has `r n_distinct(child2022$moth_age)` distinct values, and is measured in years.
+* `birth_wgt` has `r n_distinct(child2022$birth_wgt)` distinct values, and is measured in grams.
+* `preprg_bmi` has `r n_distinct(child2022$preprg_bmi)` distinct values, and is measured in kg/m^2^.
+* `pren_vis` has `r n_distinct(child2022$pren_vis)` distinct values.
+* `birth_int` haprg_bmis `r n_distinct(child2022$birth_int)` distinct values, and is measured in months.
+* `urban` has `r n_distinct(child2022$urban)` distinct values.  There are `r nrow(child2022 |> filter(urban == "Very High"))` very high counties, `r nrow(child2022 |> filter(urban == "High"))` high counties, `r nrow(child2022 |> filter(urban == "Medium"))` medium counties, and `r nrow(child2022 |> filter(urban == "Low"))` low counties.  The origin variable for `urban`, `pct_rural` was removed from `child2022` earlier, and so is not influencing the result here.
+* `chld_sph` has `r n_distinct(child2022$chld_sph)` distinct values.
+
+To iterate on the number of entries per category in the `urban` variable:
+
+```{r}
+child2022 |>
+  tabyl(urban) |>
+  adorn_totals(where = c("row"))
+```
+
+In total, we are considering 7 predictive variables.  The maximum number of variables we should consider is 4 + (N~1~ - 100)/100.  In this case, N~1~ is the number of rows with complete outcome data, which is `r nrow(child2022) - n_miss(child2022$birth_rt)` rows with complete outcome data, and happens to be the entire tibble.  Following the equation, we see `r 4 + ((569-100)/100)` variables (rounded down to 8) should be permissible for our uses here.  As we only have 7, we do not have too many predictor variables.
+
+### Anticipated Direction of Effects
+
+I expect that the birth rate will be negatively correlated with `moth_age` (due to younger mothers having more children), positively correlated with `birth_wgt` (more healthy births having higher weights), negatively correlated with `preprg_bmi` (more births occuring with lower maternal BMIs), negatively correlated with `birth_int` (longer periods between births relate to fewer births), positively correlated with `pren_vis` (more doctors visits mean more chances of atching issues prior to birth), and negatively correlated with `chld_sph` (many single parent households being less likely to have more births).  I also expect that high and very high `urban` groups will have more births, likely as a result of urban regions tending to have larger populations.
+
+# Logistic Regression Plans
+
+## My Second Research Question
+
+How effectively can we predict whether or not a county's child poverty rate is above the national average of 16.3% in 2022 based on the child mortality rate, the percentage of children without health insurance, the average number of prenatal doctors visits by mothers, the percentage of children in single parent households, and how urban the county is?
+
+The ability to predict if a county's child poverty rate is above or below the national average could be a useful tool in continuous tracking of overall outcomes for children as they grow older, and can also be indicative of where additional health care resources and educational resources may need to be diverted in the future.
+
+## My Binary Outcome
+
+The logistic regression outcome will be `hi_chld_pov` in `child2022`.  I am interested in predicting this variable as the ability to predict if a county's child poverty rate is above or below the national average could be a useful tool in continuous tracking of overall outcomes for children as they grow older, and can also be indicative of where additional health care resources and educational resources may need to be diverted in the future.
+
+For `hi_chld_pov`, we will want to check how many counties are above the national average (yes) and how many are below the national average (no).
+
+```{r}
+child2022 |>
+  tabyl(hi_chld_pov) |>
+  adorn_totals(where = c("row"))
+```
+
+Of these two variables, the lower is yes, with 216 represented measurements.
+
+## My Planned Predictors (Logistic Model)
+
+The predictors I plan to use are `chld_mort`, `chld_unin`, `pren_vis`, `chld_sph`, and `urban`.
+
+* `chld_mort` has `r n_distinct(child2022$chld_mort)` distinct values, and is measured in deaths per 100,000.
+* `chld_unin` has `r n_distinct(child2022$chld_unin)` distinct values.
+* `pren_vis` has `r n_distinct(child2022$pren_vis)` distinct values.
+* `chld_sph` has `r n_distinct(child2022$chld_sph)` distinct values.
+* `urban` has `r n_distinct(child2022$urban)` distinct values.  There are `r nrow(child2022 |> filter(urban == "Very High"))` very high counties, `r nrow(child2022 |> filter(urban == "High"))` high counties, `r nrow(child2022 |> filter(urban == "Medium"))` medium counties, `r nrow(child2022 |> filter(urban == "Low"))` low counties, and `r nrow(child2022 |> filter(urban == "Very Low"))` very low counties.  The origin variable for `urban`, `pct_rural` was removed from `child2022` earlier, and so is not influencing the result here.
+
+To iterate on the number of entries per category in the `urban` variable:
+
+```{r}
+child2022 |>
+  tabyl(urban) |>
+  adorn_totals(where = c("row"))
+```
+
+In total, we are considering 5 variables.  The maximum number of variables we should consider is 4 + (N~2~ - 100)/100.  In this case, N~2~ is the number of rows with complete outcome data for the smaller outcome group (yes), which is 216 rows with complete outcome data.  Following the equation, we see `r 4 + ((216-100)/100)` variables (rounded down to 5) should be permissible for our uses here.  We have the maximum number of predictors that we should be using for our purposes here.
+
+### Anticipated Direction of Effects
+
+I anticipate that high levels of child mortality will tend to correlate with higher poverty levels (`chld_sph`), and will be more likely to predict child poverty.  I predict the high percentages of children without health insurance (`chld_unin`) will also predict higher levels of child poverty.  I predict that low levels of prenatal visits (`pren_vis`) will also predict higher rates of child poverty, as mothers who cannot afford prenatal healthcare are more likely to be impoverished.  I predict that counties with higher percentages of children in single parent households (`chld_sph`) will positively correlate with the higher rates of child poverty.  I also predict that counties with low or very low `urban` levels will be more likely to exhibit child poverty, as there will be fewer opportunities for economic advancement.
+
+# Affirmation
+
+I am certain that it is completely appropriate for these data to be shared with anyone, without any conditions. There are no concerns about privacy or security.
+
+# References
+
+1. CDC Wonder Natality data from 2016-2022 are found at https://wonder.cdc.gov/natality.html.
+2. County Health Rankings data for 2022 are found at https://www.countyhealthrankings.org/health-data/methodology-and-sources/rankings-data-documentation.
+3. Information on the US national poverty rate can be found at https://www.census.gov/library/stories/2023/12/poverty-rate-varies-by-age-groups.html.
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```
